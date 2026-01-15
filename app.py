@@ -14,9 +14,17 @@ app = Flask(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-WOOVI_APP_ID = os.getenv("WOOVI_APP_ID", "")  # Authorization header
+WOOVI_APP_ID = os.getenv("WOOVI_APP_ID", "")  # Authorization header (AppID)
 WOOVI_HMAC_SECRET = os.getenv("WOOVI_HMAC_SECRET", "")  # webhook secret (HMAC)
-WOOVI_API_BASE = os.getenv("WOOVI_API_BASE", "https://api.woovi.com")  # prod default
+# Produção oficial: https://api.openpix.com.br | Sandbox: https://api.woovi-sandbox.com
+WOOVI_API_BASE = os.getenv("WOOVI_API_BASE", "https://api.openpix.com.br")
+
+# Chamada para o seu servidor do BOT (Oracle)
+BOT_CALLBACK_URL = os.getenv("BOT_CALLBACK_URL", "")  # ex: https://SEU-DOMINIO-DO-BOT/woovi/callback
+BOT_CALLBACK_SECRET = os.getenv("BOT_CALLBACK_SECRET", "")  # string forte
+
+# Se quiser, evita duplicidade por re-tentativas de webhook
+PROCESSED_CACHE = set()
 
 
 def brl_from_cents(value_cents) -> str:
@@ -47,10 +55,9 @@ def telegram_send(text: str):
 
 def verify_hmac_sha1(raw_body: bytes, signature_b64: str) -> bool:
     """
-    Valida X-OpenPix-Signature (HMAC-SHA1 base64) — conforme docs OpenPix/Woovi.
+    Valida X-OpenPix-Signature (HMAC-SHA1 base64)
     """
     if not WOOVI_HMAC_SECRET:
-        # Se você preferir não bloquear, troque para return True
         app.logger.warning("WOOVI_HMAC_SECRET não definido. Bloqueando webhook por segurança.")
         return False
 
@@ -80,6 +87,37 @@ def extract_charge_info(payload: dict):
     }
 
 
+def notify_bot_payment_completed(info: dict, event: str):
+    """
+    Chama o endpoint do BOT (no seu servidor Oracle) para creditar saldo automaticamente.
+    """
+    if not BOT_CALLBACK_URL or not BOT_CALLBACK_SECRET:
+        app.logger.warning("BOT_CALLBACK_URL/SECRET não configurados. Não vou creditar automaticamente.")
+        return
+
+    payload = {
+        "event": event,
+        "correlationID": info.get("correlationID"),
+        "identifier": info.get("identifier"),
+        "value": info.get("value"),
+        "customer_name": info.get("name"),
+        "ts": datetime.utcnow().isoformat() + "Z"
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-BGD-SECRET": BOT_CALLBACK_SECRET,
+    }
+
+    try:
+        r = requests.post(BOT_CALLBACK_URL, json=payload, headers=headers, timeout=15)
+        if r.status_code >= 400:
+            app.logger.error("Callback BOT falhou: %s %s", r.status_code, r.text[:300])
+        return
+    except Exception as e:
+        app.logger.exception("Erro chamando BOT_CALLBACK_URL: %s", e)
+
+
 @app.get("/")
 def home():
     return "OK", 200
@@ -94,7 +132,6 @@ def health():
 def woovi_webhook():
     raw = request.get_data()
 
-    # Assinatura (se vier no header, validamos)
     sig = request.headers.get("X-OpenPix-Signature")
     if sig:
         if not verify_hmac_sha1(raw, sig):
@@ -107,6 +144,12 @@ def woovi_webhook():
     cid = info["correlationID"] or info["identifier"] or "—"
     value_brl = brl_from_cents(info["value"]) if info["value"] is not None else "—"
 
+    # Anti-duplicidade simples (webhook pode reenviar)
+    dedup_key = f"{event}|{cid}"
+    if dedup_key in PROCESSED_CACHE:
+        return jsonify({"status": "duplicate_ignored"}), 200
+    PROCESSED_CACHE.add(dedup_key)
+
     if event == "OPENPIX:CHARGE_CREATED":
         telegram_send(
             f"🧾 Nova cobrança criada\n"
@@ -115,6 +158,7 @@ def woovi_webhook():
             f"🆔 ID: {cid}\n"
             f"🔗 Link: {info['paymentLink'] or '—'}"
         )
+
     elif event == "OPENPIX:CHARGE_COMPLETED":
         telegram_send(
             f"✅ PAGAMENTO CONFIRMADO\n"
@@ -122,6 +166,10 @@ def woovi_webhook():
             f"💰 Valor: {value_brl}\n"
             f"🧾 Cobrança: {cid}"
         )
+
+        # ✅ aqui é a INTEGRAÇÃO REAL (crédito automático no bot)
+        notify_bot_payment_completed(info, event)
+
     elif event == "OPENPIX:CHARGE_EXPIRED":
         telegram_send(
             f"⏳ Cobrança expirada\n"
@@ -138,15 +186,15 @@ def woovi_webhook():
 @app.post("/create-charge")
 def create_charge():
     """
-    Cria cobrança via API Woovi.
+    Cria cobrança via API Woovi/OpenPix.
     Body:
     {
       "value": 1500,  # centavos
+      "correlationID": "bgd|uid:123|cents:1500|<uuid>" (opcional)
       "name": "Fulano" (opcional),
       "email": "..." (opcional),
       "phone": "..." (opcional),
       "taxID": "..." (opcional),
-      "correlationID": "..." (opcional),
       "comment": "..." (opcional)
     }
     """
@@ -175,11 +223,10 @@ def create_charge():
     url = f"{WOOVI_API_BASE}/api/v1/charge"
     headers = {
         "Authorization": WOOVI_APP_ID,
-        "Content-Type": "application/json",
         "Accept": "application/json",
     }
 
-    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=20)
+    r = requests.post(url, headers=headers, json=payload, timeout=20)
     if r.status_code >= 400:
         return jsonify({"error": "woovi_error", "status": r.status_code, "body": r.text}), 400
 
