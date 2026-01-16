@@ -171,6 +171,8 @@ def woovi_webhook():
         )
 
         # ✅ aqui é a INTEGRAÇÃO REAL (crédito automático no bot)
+        payer = info["name"]
+        notify_receiver(event, cid, info["value"], payer)
         notify_bot_payment_completed(info, event)
 
     elif event == "OPENPIX:CHARGE_EXPIRED":
@@ -267,4 +269,5 @@ def create_charge():
         "identifier": charge.get("identifier"),
         "status": charge.get("status"),
     }), 200
+
 
