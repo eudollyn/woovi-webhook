@@ -23,6 +23,9 @@ WOOVI_API_BASE = os.getenv("WOOVI_API_BASE", "https://api.openpix.com.br")
 BOT_CALLBACK_URL = os.getenv("BOT_CALLBACK_URL", "")  # ex: https://SEU-DOMINIO-DO-BOT/woovi/callback
 BOT_CALLBACK_SECRET = os.getenv("BOT_CALLBACK_SECRET", "")  # string forte
 
+BGD_RECEIVER_URL = os.getenv("BGD_RECEIVER_URL", "")
+BGD_RECEIVER_SECRET = os.getenv("BGD_RECEIVER_SECRET", "")
+
 # Se quiser, evita duplicidade por re-tentativas de webhook
 PROCESSED_CACHE = set()
 
@@ -182,6 +185,30 @@ def woovi_webhook():
 
     return jsonify({"status": "recebido"}), 200
 
+def notify_receiver(event: str, correlation_id: str, value_cents: int, payer_name: str = "—"):
+    if not BGD_RECEIVER_URL or not BGD_RECEIVER_SECRET:
+        app.logger.warning("Receiver URL/SECRET não configurados.")
+        return
+
+    payload = {
+        "event": event,
+        "correlationID": correlation_id,
+        "value": int(value_cents),
+        "payer": payer_name
+    }
+
+    try:
+        r = requests.post(
+            BGD_RECEIVER_URL,
+            json=payload,
+            headers={"X-Receiver-Secret": BGD_RECEIVER_SECRET},
+            timeout=20,
+        )
+        if r.status_code >= 400:
+            app.logger.error("Receiver erro: %s %s", r.status_code, r.text[:400])
+    except Exception as e:
+        app.logger.error("Receiver exception: %s", str(e))
+
 
 @app.post("/create-charge")
 def create_charge():
@@ -240,3 +267,4 @@ def create_charge():
         "identifier": charge.get("identifier"),
         "status": charge.get("status"),
     }), 200
+
